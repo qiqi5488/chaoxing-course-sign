@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#f5f7f4">
+    <meta name="description" content="课签账号中心：管理学习通账号、登录状态与会话授权。">
+    <title>课签 · 账号中心</title>
+    <link rel="icon" type="image/svg+xml" href="./icon.svg">
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+    <div class="app-shell">
+      <header class="app-header">
+        <a class="brand" href="#/accounts" aria-label="课签账号中心">
+          <img src="./icon.svg" alt="" width="34" height="34">
+          <span>课签<small>ACCOUNT SPACE</small></span>
+        </a>
+        <div class="header-actions">
+          <span class="environment"><i></i><span id="service-status">连接服务中</span></span>
+          <button class="icon-button" data-action="about" aria-label="关于账号服务" id="help-button"></button>
+        </div>
+      </header>
+      <div class="service-strip"><span id="service-strip-icon"></span><span id="service-message" role="status">正在连接账号服务…</span><button data-action="refresh">刷新状态</button></div>
+      <main id="main" tabindex="-1"></main>
+      <nav class="bottom-nav" aria-label="主要导航">
+        <a href="#/accounts" data-nav="accounts"><span class="nav-icon" id="nav-accounts-icon"></span><span>账号</span></a>
+        <a class="nav-scan" href="#/scan" data-nav="scan" aria-label="批量扫码签到"><span id="nav-scan-icon"></span><span>扫码</span></a>
+        <a href="#/monitor" data-nav="monitor"><span class="nav-icon" id="nav-monitor-icon"></span><span>监控</span></a>
+        <a href="#/authorizations" data-nav="authorizations"><span class="nav-icon" id="nav-grants-icon"></span><span>授权</span></a>
+      </nav>
+    </div>
+    <dialog id="sheet" class="sheet" aria-labelledby="sheet-title"></dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <noscript><p class="noscript">请启用 JavaScript 后使用账号中心。</p></noscript>
+  </body>
+</html>

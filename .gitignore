@@ -1,0 +1,43 @@
+# This workspace also contains private runtime data and reverse-engineering captures.
+# Keep the repository limited to the three application components.
+/*
+!/.gitignore
+!/README.md
+!/implementation/
+/implementation/*
+!/implementation/chaoxing-direct/
+!/implementation/course-service/
+!/implementation/course-web/
+
+# Local sessions, credentials, databases, captures, and generated files.
+**/var/
+**/node_modules/
+**/__pycache__/
+**/.pytest_cache/
+**/.venv/
+**/venv/
+**/.env
+**/.env.*
+*.pyc
+*.pyo
+*.key
+*.pem
+*.p12
+*.pfx
+*.sqlite*
+*.db
+*.db-*
+*.enc
+*.log
+*.har
+*.saz
+*.pcap*
+*.apk
+*.zip
+
+# Historical local investigation and acceptance notes stay on this machine.
+*.txt
+!**/requirements.txt
+!**/requirements-dev.txt
+!/implementation/course-web/dist/vendor/jsQR-LICENSE.txt
+!/implementation/course-web/dist/vendor/jsQR-SOURCE.txt

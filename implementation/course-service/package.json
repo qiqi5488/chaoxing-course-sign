@@ -1,0 +1,11 @@
+{
+  "name": "course-service-im-receiver",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "test:im": "node --test tests/im-receiver.test.cjs"
+  },
+  "dependencies": {
+    "easemob-websdk": "4.24.3"
+  }
+}
