@@ -434,3 +434,41 @@ def test_job_storage_failure_does_not_leave_an_unrecoverable_pending_task(monito
     monkeypatch.setattr(monitor.vault, 'save_job', save_job)
     assert run(monitor)['tasks'][0]['status'] == 'reported_success'
     assert len(monitor.gateway.sign_calls) == 1
+
+def test_course_photo_activity_uses_photo_pool_when_enabled(monitor, monkeypatch):
+    """课程拍照签到：走照片池通道，不经过普通签到网关。"""
+    import course_monitor as monitor_module
+    monitor.gateway.activities = [{**ACTIVITY, 'kind': 'photo', 'status': 'active',
+                                   'requirements': ['photo'], 'autoEligible': False}]
+    calls = {}
+
+    def fake_auto_sign(cookies, identity, active_id, course_id, class_id, data_dir, key,
+                       dry_run=True, window=90):
+        calls.update(active_id=active_id, course_id=course_id, class_id=class_id,
+                     dry_run=dry_run, window=window, key=key)
+        return {'status': 'reported_success', 'reasonOfPick': 'course:random', 'candidates': 2,
+                'picked': {'activeId': active_id, 'objectId': 'a' * 32, 'title': '测试签到'},
+                'submit': {'submitted': True},
+                'verify': {'signed': True, 'matches': True}}
+
+    monkeypatch.setattr(monitor_module.photo_pool, 'auto_sign', fake_auto_sign)
+    enable(monitor)
+    snapshot = run(monitor)
+    task = snapshot['tasks'][0]
+    assert calls['dry_run'] is False
+    assert calls['active_id'] == ACTIVITY['activeId']
+    assert calls['key'] == 'uid1001'
+    assert task['status'] == 'reported_success'
+    job, _ = monitor.vault.get_job(monitor.ref, task['requestId'])
+    assert job['photo']['reasonOfPick'] == 'course:random'
+    assert job['photo']['candidates'] == 2
+    assert monitor.gateway.sign_calls == []
+
+
+def test_course_photo_activity_stays_manual_without_auto_sign(monitor):
+    monitor.gateway.activities = [{**ACTIVITY, 'kind': 'photo', 'status': 'active',
+                                   'requirements': ['photo'], 'autoEligible': False}]
+    enable(monitor, auto=False)
+    snapshot = run(monitor)
+    assert snapshot['tasks'][0]['status'] == 'monitoring_only'
+    assert monitor.gateway.sign_calls == []

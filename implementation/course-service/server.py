@@ -22,13 +22,19 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from upstream import UpstreamGateway, UpstreamError
-from vault import Vault, DAY, event, iso, public_state, repair, timestamp
+from vault import Vault, DAY, empty_state, event, iso, public_state, repair, timestamp
 from qr_batches import QrBatchManager, receipt
 from qr_diagnostics import qr_diagnostics
 from course_monitor import CourseMonitor, require_no_cooldown, session_stamp
 from sign_history import successful_records, official_snapshot, history_page
+import photo_pool
 
 LEGACY_COOKIE = 'keqian_session'
+
+# 单用户/本机部署的兜底房间：设置 COURSE_SINGLE_WORKSPACE 后，缺失或失效的
+# 浏览器 cookie 一律落到这个固定 workspace（内嵌 iframe、清缓存、换主机名都不会再变空）。
+# 不设置时保持原行为：拿不到 cookie 就新建，cookie 失效就报 workspace_changed。
+DEFAULT_WORKSPACE = (os.environ.get('COURSE_SINGLE_WORKSPACE') or '').strip()
 
 
 def cookie_name(public_origin):
@@ -153,6 +159,15 @@ class Sign(Input):
         return self
 
 
+class PhotoSignAuto(Input):
+    """用照片池里的历史照片自动签到。dryRun 默认 true，必须显式关闭才会提交。"""
+    activeId: str = Field(pattern=r'^\d{1,32}$')
+    courseId: str = Field(pattern=r'^\d{1,32}$')
+    classId: str = Field(pattern=r'^\d{1,32}$')
+    dryRun: bool = True
+    window: int = Field(default=90, ge=0, le=720)
+
+
 class QrBatch(Input):
     accountIds: list[str] = Field(min_length=1, max_length=100)
     qrText: str = Field(min_length=1, max_length=8192)
@@ -162,6 +177,7 @@ class QrBatch(Input):
 class MonitorSettings(Input):
     enabled: bool
     autoSign: bool = False
+    photoAutoSign: bool = True
     intervalSeconds: int = Field(default=10, ge=10, le=300)
 
 
@@ -245,7 +261,7 @@ def create_app(settings=None, gateway=None):
         if api and request.headers.get('sec-fetch-site') == 'cross-site':
             return JSONResponse({'error': {'code': 'origin_forbidden', 'message': '不接受跨站请求。'}}, status_code=403)
         if api and request.method not in ('GET', 'HEAD', 'OPTIONS'):
-            token = request.cookies.get(session_cookie, '')
+            token = token_for(request)
             supplied = request.headers.get('x-csrf-token', '')
             if not token or not secrets.compare_digest(supplied, vault.csrf(token)):
                 return JSONResponse({'error': {'code': 'csrf_failed', 'message': '页面会话已变化，请刷新后重试。'}}, status_code=403)
@@ -259,9 +275,26 @@ def create_app(settings=None, gateway=None):
         response.headers['X-Frame-Options'] = 'DENY'
         return response
 
-    def workspace(request):
+    def default_state():
+        """Fixed workspace state; created on demand so it never goes missing."""
+        owner = vault.owner(DEFAULT_WORKSPACE)
+        with vault.connection() as db:
+            row = db.execute('SELECT ciphertext FROM vaults WHERE owner=?', (owner,)).fetchone()
+            if row is None:
+                db.execute('INSERT INTO vaults VALUES (?,?,?)', (owner, 0, vault.encrypt(empty_state(), owner)))
+        return vault.load(DEFAULT_WORKSPACE) or empty_state()
+
+    def token_for(request):
+        """Cookie token when it maps to a stored workspace; with single-workspace mode
+        an unknown or absent token falls back to the fixed workspace."""
         token = request.cookies.get(session_cookie, '')
-        state = vault.load(token) if token else None
+        if token and vault.load(token) is not None:
+            return token
+        return DEFAULT_WORKSPACE or token
+
+    def workspace(request):
+        token = token_for(request)
+        state = vault.load(token)
         if state is None:
             raise ApiError('workspace_expired', '网页会话已过期，请刷新页面。', 401)
         return token, state
@@ -311,12 +344,17 @@ def create_app(settings=None, gateway=None):
         limiter.check(('bootstrap', request.client.host if request.client else 'unknown'), 60, 60)
         scoped_token = request.cookies.get(session_cookie, '')
         token = scoped_token or request.cookies.get(LEGACY_COOKIE, '')
-        with vault.lock(token):
-            state = vault.load(token) if token else None
-            if scoped_token and state is None:
+        state = vault.load(token) if token else None
+        if state is None:
+            if DEFAULT_WORKSPACE:
+                # 单用户模式：未知/缺失 cookie 落到固定 workspace，不再新建也不再报错
+                token = DEFAULT_WORKSPACE
+                state = default_state()
+            elif scoped_token:
                 raise ApiError('workspace_changed', '网页会话标识已失效，原账号数据没有被删除，请恢复原账号空间。', 409)
-            if state is None:
+            else:
                 token, state = vault.create()
+        with vault.lock(token):
             # Refresh only the website's persistent access cookie. This never
             # changes the validity of Chaoxing's own login cookies.
             response.set_cookie(session_cookie, token, max_age=BROWSER_SESSION_MAX_AGE, httponly=True,
@@ -343,7 +381,12 @@ def create_app(settings=None, gateway=None):
                 raise ApiError('invalid_input', '请填写学习通账号。', 422)
             result = gateway.login(identifier, body.password.get_secret_value())
             row = update_login(state, result, identifier, body.nickname)
-            return {'accountId': row['id'], **save(token, state)}
+            response = {'accountId': row['id'], **save(token, state)}
+            try:
+                response['photoPool'] = start_photo_harvest(row)
+            except Exception:
+                response['photoPool'] = {'state': 'skipped'}
+            return response
 
     @app.post('/api/accounts/{account_id}/relogin')
     def relogin(account_id: str, body: Relogin, request: Request):
@@ -354,7 +397,12 @@ def create_app(settings=None, gateway=None):
             login_limit(request, token)
             result = gateway.login(row['_identifier'], body.password.get_secret_value())
             update_login(state, result, row['_identifier'], row['name'], row)
-            return {'accountId': row['id'], **save(token, state)}
+            response = {'accountId': row['id'], **save(token, state)}
+            try:
+                response['photoPool'] = start_photo_harvest(row)
+            except Exception:
+                response['photoPool'] = {'state': 'skipped'}
+            return response
 
     @app.get('/api/accounts/{account_id}/details')
     def account_details(account_id: str, request: Request, refresh: bool = False):
@@ -761,8 +809,10 @@ def create_app(settings=None, gateway=None):
             token, state = workspace(request)
             row = account(state, account_id, active=body.enabled)
             limiter.check(('monitor-settings', vault.owner(token)), 30, 60)
-            monitor_manager.configure(token, account_id, body.enabled, body.autoSign, body.intervalSeconds)
-            event(state, row, '开启课程与群聊监控及普通自动签到' if body.enabled and body.autoSign else
+            monitor_manager.configure(token, account_id, body.enabled, body.autoSign,
+                                      body.intervalSeconds, body.photoAutoSign)
+            event(state, row, '开启课程与群聊监控及自动签到（含拍照签到照片池）'
+                  if body.enabled and body.autoSign else
                   '开启课程与群聊签到监控' if body.enabled else '停止签到监控')
             vault.save(token, state)
             return monitor_manager.snapshot(token, state)
@@ -777,6 +827,83 @@ def create_app(settings=None, gateway=None):
             if not monitor_manager.check_soon(token, account_id):
                 raise ApiError('monitor_disabled', '请先开启此账号的课程监控。', 409)
             return monitor_manager.snapshot(token, state)
+
+    # ---- 拍照签到照片池：登录后自动抓取、按课程分类、按场景选图签到 ----
+    photo_jobs = {}
+
+    def pool_key(row):
+        return 'uid' + str(row['_identity']['uid'])
+
+    def pool_summary(row):
+        key = pool_key(row)
+        pool = photo_pool.load(settings.data_dir, key)
+        job = dict(photo_jobs.get(key) or {})
+        if not pool:
+            return {'ready': False, 'account': row['name'], 'job': job, 'stats': None,
+                    'path': str(photo_pool.pool_path(settings.data_dir, key))}
+        return {'ready': True, 'account': row['name'], 'job': job,
+                'stats': pool.get('stats'), 'builtAt': pool.get('builtAt'),
+                'courses': [{'courseId': cid, 'courseName': course['courseName'],
+                             'className': course.get('className'), 'classCourse': course['classCourse'],
+                             'photoCount': course['photoCount']}
+                            for cid, course in (pool.get('courses') or {}).items()],
+                'path': str(photo_pool.pool_path(settings.data_dir, key))}
+
+    def start_photo_harvest(row):
+        """后台抓取照片池；同一账号同时只跑一个任务。"""
+        key = pool_key(row)
+        job = photo_jobs.get(key)
+        if job and job.get('state') == 'running':
+            return job
+        job = {'state': 'running', 'startedAt': iso(), 'stats': None, 'error': None}
+        photo_jobs[key] = job
+        snapshot = {'cookies': list(row['_cookies']),
+                    'uid': str(row['_identity']['uid']), 'fid': str(row['_identity']['fid'])}
+
+        def run():
+            with photo_pool.account_lock(key):
+                try:
+                    pool = photo_pool.harvest(snapshot['cookies'], snapshot['uid'], snapshot['fid'],
+                                              settings.data_dir, key)
+                    job.update(state='done', stats=pool['stats'], finishedAt=iso())
+                except Exception as exc:  # 上游波动不应影响服务本身
+                    LOGGER.warning('photo_pool_harvest_failed account=%s error=%s', key, type(exc).__name__)
+                    job.update(state='error', error='照片池抓取未完成，请稍后重试。', finishedAt=iso())
+
+        threading.Thread(target=run, name=f'photo-pool-{key}', daemon=True).start()
+        return job
+
+    @app.get('/api/accounts/{account_id}/photo-pool')
+    def photo_pool_status(account_id: str, request: Request):
+        token = request.cookies.get(session_cookie, '')
+        with vault.lock(token):
+            token, state = workspace(request)
+            row = account(state, account_id, active=True)
+            return pool_summary(row)
+
+    @app.post('/api/accounts/{account_id}/photo-pool/rebuild', status_code=202)
+    def photo_pool_rebuild(account_id: str, request: Request):
+        token = request.cookies.get(session_cookie, '')
+        with vault.lock(token):
+            token, state = workspace(request)
+            row = account(state, account_id, active=True)
+            limiter.check(('photo-pool', vault.owner(token), account_id), 6, 60)
+            return {'job': start_photo_harvest(row)}
+
+    @app.post('/api/accounts/{account_id}/photo-sign/auto')
+    def photo_sign_auto(account_id: str, body: PhotoSignAuto, request: Request):
+        token = request.cookies.get(session_cookie, '')
+        with vault.lock(token):
+            token, state = workspace(request)
+            row = account(state, account_id, active=True)
+            limiter.check(('photo-sign', vault.owner(token), account_id), 10, 60)
+            data = {'cookies': list(row['_cookies']), 'account': dict(row['_identity']),
+                    'key': pool_key(row)}
+        result = photo_pool.auto_sign(data['cookies'], data['account'], body.activeId, body.courseId,
+                                      body.classId, settings.data_dir, data['key'],
+                                      dry_run=body.dryRun, window=body.window)
+        result['account'] = row['name']
+        return result
 
     @app.api_route('/api/{unmatched:path}', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], include_in_schema=False)
     def missing_api(unmatched: str):

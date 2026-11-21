@@ -11,6 +11,8 @@ import time
 from upstream import UpstreamError
 from vault import WorkspaceRef, event, iso, timestamp
 from im_receiver import RealtimeReceivers
+from pathlib import Path
+import photo_pool
 
 
 SESSION_ERRORS = {'session_expired', 'session_missing', 'login_required', 'invalid_session'}
@@ -21,7 +23,7 @@ RESULTS = {'reported_success', 'already_signed', 'requires_validation', 'invalid
 MANUAL = {'qr': '需要扫描老师提供的二维码。', 'code': '需要老师提供的签到码或手势。',
           'gesture': '手势活动需先核对进行状态与附加要求。',
           'position': '需要在学习通提供真实位置。', 'located_code': '需要签到码和真实位置。',
-          'photo': '课程同活动照片的读取接口尚未核实，请先在学习通完成拍照签到。', 'face': '需要在学习通完成人脸验证。'}
+          'photo': '需要在学习通完成拍照签到（可用照片池自动选图）。', 'face': '需要在学习通完成人脸验证。'}
 LOGGER = logging.getLogger('uvicorn.error.course.monitor')
 
 
@@ -44,7 +46,7 @@ def sync_task_result(task, job):
 
 
 def defaults():
-    return {'enabled': False, 'autoSign': False, 'intervalSeconds': 10,
+    return {'enabled': False, 'autoSign': False, 'photoAutoSign': True, 'intervalSeconds': 10,
             'status': 'disabled', 'message': '尚未开启课程监控。',
             'lastCheckedAt': None, 'nextCheckAt': None, 'cooldownUntil': None, 'courseListCooldownUntil': None,
             'courseCount': 0, 'courseErrors': [],
@@ -137,7 +139,7 @@ class CourseMonitor:
         return {'accounts': accounts, 'tasks': [t for t in monitor['tasks'] if t['accountId'] in ids],
                 'serverTime': iso()}
 
-    def configure(self, token, account_id, enabled, auto_sign, interval):
+    def configure(self, token, account_id, enabled, auto_sign, interval, photo_auto_sign=True):
         # Caller holds the workspace lock and checks account ownership/consent.
         monitor = self.vault.load_monitor(token)
         config = {**defaults(), **monitor['accounts'].get(account_id, {})}
@@ -146,7 +148,8 @@ class CourseMonitor:
             config['imEpoch'] = secrets.token_hex(12)
             config.update(realtimeStatus='connecting' if enabled else 'disabled',
                           realtimeMessage='正在连接学习通实时消息。' if enabled else '实时消息已停止。')
-        config.update(enabled=enabled, autoSign=auto_sign, intervalSeconds=interval,
+        config.update(enabled=enabled, autoSign=auto_sign, photoAutoSign=photo_auto_sign,
+                      intervalSeconds=interval,
                       version=secrets.token_hex(12), failures=0,
                       nextCheckAt=iso() if enabled else None,
                       status='waiting' if enabled else 'disabled',
@@ -768,9 +771,38 @@ class CourseMonitor:
                 task.update(status='monitoring_only', message=f'发现{label}；可直接签到，自动签到尚未开启。')
                 if config['autoSign'] or force:
                     task.update(status='pending', message=f'正在核验并提交{label}。', requestId=request_id)
+            elif (activity_scope == 'course' and status == 'active' and kind == 'photo'
+                  and activity.get('requirements') == ['photo']):
+                # 课程拍照签到：用该账号自己的历史照片池选图提交（班级课程按星期几+时间就近）
+                task.update(status='monitoring_only', message='发现课程拍照签到；可用照片池选图签到。')
+                if (config['autoSign'] and config.get('photoAutoSign', True)) or force:
+                    task.update(status='pending', message='正在用照片池选图并提交拍照签到。', requestId=request_id)
             if task['status'] != 'pending':
                 self.vault.save_monitor(ref, monitor)
                 return
+            if activity_scope == 'course' and kind == 'photo':
+                photo_payload = {'activeId': active_id, 'courseId': str(course['courseId']),
+                                 'classId': str(course['classId']),
+                                 'window': int(config.get('photoWindowMinutes') or 90)}
+                photo_fingerprint = previous_hash or hashlib.sha256(
+                    json.dumps(photo_payload, sort_keys=True).encode()).hexdigest()
+                photo_job = {'requestId': request_id, 'accountId': account_id, 'activeId': active_id,
+                             'name': task['name'], 'courseName': task['courseName'], 'kind': 'photo',
+                             'resolvedKind': 'photo', 'status': 'pending', 'message': task['message'],
+                             'createdAt': (previous or {}).get('createdAt') or iso()}
+                sync_task_result(task, photo_job)
+                self.vault.save_job(ref, photo_job, photo_fingerprint)
+                # 先落重复守卫，再发网络请求
+                self.vault.save_monitor(ref, monitor)
+                photo_cookies, photo_identity = row['_cookies'], dict(row['_identity'])
+                photo_version = config.get('settingsVersion', version)
+                photo_args = (ref, account_id, version, stamp, request_id, task_id, photo_job,
+                              photo_fingerprint, photo_cookies, photo_identity, photo_payload, not force)
+                if enqueue:
+                    self.pool.submit(self._execute_photo_sign, *photo_args, settings_version=photo_version)
+                else:
+                    self._execute_photo_sign(*photo_args, settings_version=photo_version)
+                return request_id
             payload = {'kind': 'gesture' if kind == 'gesture' else 'ordinary', 'activeId': active_id, 'courseId': str(course['courseId']),
                        'classId': str(course['classId']), '_autoSign': True}
             course_hint = ' '.join(str(name or '') for name in (course.get('name'), activity.get('name')))
@@ -875,4 +907,79 @@ class CourseMonitor:
                 elif raw.get('cookies') is not None and row['_cookies'] == cookies:
                     row['_cookies'] = raw['cookies']
             event(state, row, ('自动签到：' if automatic else '签到：') + job['message'])
+            self.vault.save(ref, state)
+
+    def _execute_photo_sign(self, ref, account_id, version, stamp, request_id, task_id, job, fingerprint,
+                            cookies, identity, payload, automatic, *, settings_version=None):
+        """课程拍照签到：用该账号自己的照片池选图提交，提交前后都复查。"""
+        with self.vault.lock(ref):
+            state, monitor, row, config, valid = self._current(ref, account_id, allow_disabled=not automatic)
+            saved, _ = self.vault.get_job(ref, request_id)
+            if row is None or saved is None:
+                return
+            valid = valid and session_stamp(row) == stamp
+            cooling = bool(cooldown_seconds(config))
+            valid = valid and not cooling
+            if automatic:
+                valid = (valid and config.get('settingsVersion', config['version']) == (
+                    settings_version if settings_version is not None else version)
+                    and config['autoSign'] and config.get('photoAutoSign', True))
+            if not valid:
+                job.update(status='skipped', submitted=False, phase='before_submit', completedAt=iso(),
+                           message='学习通操作受限，排队请求尚未发出。' if cooling else
+                           '账号授权、会话或监控设置已变化，请求尚未发出，已停止本次签到。')
+                self.vault.save_job(ref, job, fingerprint)
+                task = next((t for t in monitor['tasks'] if t['id'] == task_id), None)
+                if task:
+                    task.update(status=job['status'], message=job['message'], updatedAt=iso())
+                    self.vault.save_monitor(ref, monitor)
+                return
+            cookies, identity = row['_cookies'], dict(row['_identity'])
+            data_dir = str(Path(self.vault.path).parent)
+        key = 'uid' + str(identity['uid'])
+        try:
+            result = photo_pool.auto_sign(cookies, identity, payload['activeId'], payload['courseId'],
+                                          payload['classId'], data_dir, key, dry_run=False,
+                                          window=int(payload.get('window') or 90))
+            status = result.get('status') or 'unknown'
+            verified = result.get('verify') or {}
+            picked = result.get('picked') or {}
+            if status == 'reported_success' and verified.get('signed') and verified.get('matches'):
+                job.update(status='reported_success', submitted=True, phase='photo_verify',
+                           message='照片池拍照签到已提交，学习通记录已确认。',
+                           reasonCode='photo_record_verified')
+            elif status == 'already_signed':
+                job.update(status='already_signed', submitted=False, phase='photo_precheck',
+                           message='学习通显示本人已签到，未重复提交。', reasonCode='photo_already_signed')
+            elif status == 'no_photo_available':
+                job.update(status='photo_required', submitted=False, phase='photo_select',
+                           message='该课程还没有可用的历史照片，未提交。',
+                           reasonCode=result.get('reason') or 'photo_missing')
+            elif status == 'requires_validation':
+                job.update(status='requires_validation', submitted=True, phase='photo_submit',
+                           message='学习通要求验证码，拍照签到未完成。',
+                           reasonCode='photo_validation_required')
+            else:
+                job.update(status='outcome_unknown',
+                           submitted=bool((result.get('submit') or {}).get('submitted')),
+                           phase='photo_submit',
+                           message='拍照签到已提交，结果尚未确认；请在学习通核实。',
+                           reasonCode='photo_record_unverified')
+            job['photo'] = {'activeId': picked.get('activeId'), 'objectId': picked.get('objectId'),
+                            'title': picked.get('title'), 'reasonOfPick': result.get('reasonOfPick'),
+                            'candidates': result.get('candidates')}
+        except Exception:
+            job.update(status='outcome_unknown', submitted=False, phase='photo_select',
+                       message='照片池签到未能完成，请在学习通核实；不会自动重发。')
+        job['completedAt'] = iso()
+        with self.vault.lock(ref):
+            state, monitor, row, config, _ = self._current(ref, account_id)
+            if row is None or not self.vault.get_job(ref, request_id)[0]:
+                return
+            self.vault.save_job(ref, job, fingerprint)
+            task = next((t for t in monitor['tasks'] if t['id'] == task_id), None)
+            if task:
+                sync_task_result(task, job)
+                self.vault.save_monitor(ref, monitor)
+            event(state, row, ('自动拍照签到：' if automatic else '拍照签到：') + job['message'])
             self.vault.save(ref, state)
